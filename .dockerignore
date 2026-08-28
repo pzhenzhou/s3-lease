@@ -1,0 +1,15 @@
+# More info: https://docs.docker.com/engine/reference/builder/#dockerignore-file
+bin/
+tmp/
+temp/
+.git/
+.idea/
+.cursor/
+.claude/
+.github/
+*.md
+*.out
+*.test
+*.log
+logs/
+cover.out
