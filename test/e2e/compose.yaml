@@ -1,0 +1,15 @@
+services:
+  seaweedfs:
+    image: "${SEAWEEDFS_IMAGE:-chrislusf/seaweedfs:4.44}"
+    command: ["mini", "-dir=/data"]
+    environment:
+      AWS_ACCESS_KEY_ID: lease-dev
+      AWS_SECRET_ACCESS_KEY: local-test-only
+      S3_BUCKET: lease-tests
+    ports:
+      - "127.0.0.1:${S3_LEASE_E2E_PORT:-8333}:8333"
+    volumes:
+      - seaweedfs-data:/data
+
+volumes:
+  seaweedfs-data:

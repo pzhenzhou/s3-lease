@@ -10,10 +10,10 @@ import (
 
 type Work func(context.Context, uint64) error
 
-// Policy is acquisition-scoped configuration for one confirmed Handle. It is
+// Policy is acquisition-scoped configuration for one confirmed lease. It is
 // discarded only after tracked work has joined or has timed out.
 type Policy struct {
-	Lease               lease.Lease
+	Client              lease.Client
 	RetryPeriod         time.Duration
 	ShutdownTimeout     time.Duration
 	ReleaseOnWorkReturn bool

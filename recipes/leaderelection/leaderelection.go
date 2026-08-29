@@ -5,11 +5,11 @@ package leaderelection
 import (
 	"context"
 	"errors"
-	"log/slog"
-	"sync"
 	"time"
 
+	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/pzhenzhou/s3-lease/lease"
+	"go.uber.org/zap"
 )
 
 var (
@@ -20,14 +20,14 @@ var (
 
 // Config is construction-scoped and immutable for one Elector run.
 type Config struct {
-	Lease           lease.Lease
+	Client          lease.Client
 	RetryPeriod     time.Duration
 	ObserveInterval time.Duration
 	ShutdownTimeout time.Duration
 	ReleaseOnCancel bool
 	Callbacks       Callbacks
 	Metrics         Metrics
-	Logger          *slog.Logger
+	Logger          *zap.Logger
 }
 
 // Callbacks is run-scoped configuration, not a service interface. The start
@@ -45,6 +45,8 @@ type Callbacks struct {
 // Planned public operation: Run(context.Context) error.
 type Elector struct {
 	config Config
-	mu     sync.Mutex
-	used   bool
+	// mu makes the Run lifecycle single-use when multiple goroutines attempt to
+	// start the same Elector concurrently.
+	mu   xsync.RBMutex
+	used bool
 }

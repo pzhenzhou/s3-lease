@@ -4,11 +4,11 @@ package mutex
 import (
 	"context"
 	"errors"
-	"log/slog"
-	"sync"
 	"time"
 
+	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/pzhenzhou/s3-lease/lease"
+	"go.uber.org/zap"
 )
 
 var (
@@ -19,13 +19,13 @@ var (
 
 // Config is construction-scoped and immutable for the lifetime of a Mutex.
 type Config struct {
-	Lease           lease.Lease
+	Client          lease.Client
 	RetryPeriod     time.Duration
 	ObserveInterval time.Duration
 	ShutdownTimeout time.Duration
 	ReleaseOnCancel bool
 	Metrics         Metrics
-	Logger          *slog.Logger
+	Logger          *zap.Logger
 }
 
 // Work is invocation-scoped protected work.
@@ -37,6 +37,8 @@ type Work func(context.Context, uint64) error
 // Planned public operation: WithLock(context.Context, Work) error.
 type Mutex struct {
 	config Config
-	mu     sync.Mutex
-	busy   bool
+	// mu prevents concurrent WithLock lifecycles from both observing busy=false
+	// and starting protected work through the same reusable recipe instance.
+	mu   xsync.RBMutex
+	busy bool
 }

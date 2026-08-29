@@ -5,7 +5,7 @@
 | Document property | Value |
 | --- | --- |
 | Status | Draft / High-Level Design |
-| Version | v0.7-en, explicit lease-handle naming and responsibilities |
+| Version | v0.8-en, explicit client/acquired-lease naming and responsibilities |
 | Date | 2026-08-28 |
 | Audience | Distributed systems, storage platform, and Go engineering teams |
 | Scope | Lease coordination and leader election within one Region, using one authoritative S3 bucket |
@@ -78,7 +78,7 @@ Kubernetes uses Lease objects for coordination, including component leader elect
 | --- | --- | --- |
 | Lease object | Stable S3 bucket and full object key | One lease per coordinated resource; no separate namespace field |
 | `metadata.resourceVersion` | ETag | Opaque CAS validator, not a numeric revision |
-| Create | `PUT` with `If-None-Match: *` | Creates only when no current object exists |
+| Create if absent | `PUT` with `If-None-Match: *` | Creates only when no current object exists |
 | Update | `PUT` with `If-Match: <etag>` | Used for renewal, takeover, and release |
 | Get | GET | Returns the record and ETag; HEAD alone does not return the record body |
 | Kubernetes Watch | No equivalent in the core library | Polling exposes current observations and may skip transitions; notifications are hints only |
@@ -117,7 +117,7 @@ flowchart TD
 
 The core is stateful only where the protocol requires local knowledge: unchanged-version observation time, an unresolved proposal, and a confirmed grant. A local timer may close a grant's `Done` channel when its deadline expires; that performs no S3 I/O and is not automatic renewal. Public grant checks also compare the monotonic deadline so scheduler delay does not extend authority.
 
-One core Lease instance is bound to one backend/bucket/key and client ID. Use one recipe owner per instance; the core rejects overlapping mutations instead of creating a hidden work queue. Different recipes using the same authoritative key compete for the same lease. Use distinct keys when independent coordination is intended.
+One core Client is bound to one backend/bucket/key and client ID. Use one recipe owner per Client; the core rejects overlapping mutations instead of creating a hidden work queue. Different recipes using the same authoritative key compete for the same lease. Use distinct keys when independent coordination is intended.
 
 There is no `FencingMode` switch in the core. It exposes the acquired epoch; the application must activate and enforce it at protected resources. The first release includes an S3-manifest example, not a generic resource-fencing framework. Leader discovery and readiness remain application concerns.
 
@@ -277,7 +277,7 @@ Several candidates may propose the same next epoch. S3's conditional write selec
 
 ### 5.4 Renewal
 
-`Renew(ctx, handle)` requires an active grant created by this Lease instance. It performs or reconciles one logical renewal; it does not install a periodic loop. Preserve UID/client ID/epoch, increment the sequence for a new logical renewal, and use the owned ETag:
+`Renew(ctx, acquired)` requires an active lease created by this Client instance. It performs or reconciles one logical renewal; it does not install a periodic loop. Preserve UID/client ID/epoch, increment the sequence for a new logical renewal, and use the owned ETag:
 
 ```http
 PUT /lease-object
@@ -295,7 +295,7 @@ Allow one unresolved logical mutation per grant; serialize renewal and release. 
 
 ### 5.5 Core Release and Local Retirement
 
-`Release(ctx, handle)` is the explicit supporting primitive. The caller must have stopped admission and joined all work protected by the grant before calling it. The core cannot verify arbitrary application goroutines; recipes implement that completion barrier.
+`Release(ctx, acquired)` is the explicit supporting primitive. The caller must have stopped admission and joined all work protected by the lease before calling it. The core cannot verify arbitrary application goroutines; recipes implement that completion barrier.
 
 Before accepting release, reject an expired/lost/foreign grant or an unresolved renewal proposal. Once release starts, locally retire the grant, close `Done`, and forbid subsequent renewal. Build a released record with empty `clientID`, unchanged UID/epoch, and sequence incremented once; write it with the owned ETag. Exact release retries may resolve the same proposal, but can never restore work authority. They remain bounded by the original grant deadline and request/caller budgets.
 
@@ -433,7 +433,7 @@ Token ordering is scoped to one lease's bucket/key and lifetime. Tokens from ind
 
 | Proposed path | Responsibility |
 | --- | --- |
-| `lease/record.go`, `lease/handle.go` | Record schema, opaque grants, deadline checks, local retirement |
+| `lease/record.go`, `lease/core.go` | Record schema, acquired leases, deadline checks, local retirement |
 | `lease/lease.go` | `Require`, `Renew`, `Release`, `Observe`, eligibility and unresolved proposals |
 | `lease/store.go`, `lease/s3store.go` | Replaceable store contract and AWS SDK for Go v2 adapter |
 | `lease/errors.go`, `lease/metrics.go` | Core error categories and request/grant metrics |
@@ -450,39 +450,39 @@ type Key struct {
 }
 
 type LeaseStore interface {
-    Get(ctx context.Context, key Key) (LeaseRecord, Version, error)
-    Create(ctx context.Context, key Key, rec LeaseRecord) (Version, error)
+    Get(ctx context.Context, key Key) (Record, Version, error)
+    CreateIfAbsent(ctx context.Context, key Key, rec Record) (Version, error)
     CompareAndSwap(ctx context.Context, key Key, expected Version,
-        rec LeaseRecord) (Version, error)
+        rec Record) (Version, error)
 }
 ```
 
 | Store method | AWS SDK / S3 mapping |
 | --- | --- |
 | `Get` | `s3.Client.GetObject` |
-| `Create` | `s3.Client.PutObject` with `If-None-Match: *` |
+| `CreateIfAbsent` | `s3.Client.PutObject` with `If-None-Match: *` |
 | `CompareAndSwap` | `s3.Client.PutObject` with `If-Match: <etag>` |
 
 The core freezes each proposal. The adapter must preserve exact serialization across retries, never regenerate timestamps or identifiers, and retain SDK ETags unchanged. Go interface examples omit imports and implementation details; this is a proposed API, not a runnable package. Conditional GET is optional and must preserve the cached record and unchanged-version timestamp on an unchanged response.
 
 The core binds the complete bucket/key once. Endpoint, Region, credentials, and SDK configuration belong to the adapter. No recipe constructs a second coordination key or writes the store directly.
 
-### 8.2 Lease Core API
+### 8.2 Client and Acquired-Lease API
 
-**Lease handle:** the public type is `Handle` inside package `lease`, so callers use `*lease.Handle`. It represents the local result of one confirmed acquisition, not the reusable Lease client, the persisted record, or another coordination identity. The earlier name `Grant` is retired; the protocol still grants ownership through the same conditional PUT.
+The public `Client` is reusable and bound to one configured store/key/identity. A successful `Require` returns a distinct `*lease.Lease`: the local, time-bounded result of that one confirmed acquisition. It is neither the persisted `Record` nor a recoverable session.
 
 | Abstraction | Lifetime and responsibility |
 | --- | --- |
-| `Lease` | Reusable client bound to one backend/bucket/key and stable client ID; performs core operations |
-| `LeaseRecord` / `Observation` | Persisted coordination state / a locally read snapshot; reading either does not acquire ownership |
-| `Handle` | Local acquisition-scoped reference returned by successful `Require`; binds later calls to that acquired epoch and tracks its validity |
+| `Client` | Reusable participant bound to one backend/bucket/key and stable client ID; performs core operations |
+| `Record` / `Observation` | Persisted coordination state / a locally read snapshot; reading either does not acquire ownership |
+| `Lease` | Local acquisition-scoped value returned by successful `Require`; binds later calls to that acquired epoch and tracks its validity |
 
-The handle keeps the originating client/lease lifetime and acquired epoch, together with private ETag, mutation sequence, pending proposal, and deadline state. `Renew` updates the same handle's internal state without changing its epoch. `Release`, expiry, or ownership loss retires that handle permanently; reacquisition returns a new handle with a higher epoch. None of these fields introduces a new `handleID` or S3 object.
+The acquired Lease keeps its originating Client and acquired epoch, together with private ETag, mutation sequence, pending proposal, and deadline state. `Renew` updates the same Lease without changing its epoch. `Release`, expiry, or ownership loss retires it permanently; reacquisition returns a new Lease with a higher epoch. It introduces no additional persisted identity or S3 object.
 
-This explicit parameter prevents a delayed call for an old acquisition from accidentally operating on the client's newer ownership. For example, after handle H42 is retired and `Require` returns H43, `Renew(ctx, H42)` must fail; it must never silently renew H43 merely because the client ID matches. The handle is a local API guard, not a resource-side fence or authentication credential. Recipes still own automatic renewal and work shutdown.
+This explicit parameter prevents a delayed call for an old acquisition from accidentally operating on the Client's newer lease. For example, after L42 is retired and `Require` returns L43, `Renew(ctx, L42)` must fail; it must never silently renew L43 merely because the client ID matches. The Lease is local API state, not a resource-side fence or authentication credential. Recipes still own automatic renewal and work shutdown.
 
 ```go
-type LeaseConfig struct {
+type Config struct {
     Store          LeaseStore
     Key            Key
     ClientID       string
@@ -492,26 +492,26 @@ type LeaseConfig struct {
     Clock          clock.Clock
 }
 
-type Lease interface {
-    Require(ctx context.Context) (*Handle, error)
-    Renew(ctx context.Context, handle *Handle) error
-    Release(ctx context.Context, handle *Handle) error
+type Client interface {
+    Require(ctx context.Context) (*Lease, error)
+    Renew(ctx context.Context, acquired *Lease) error
+    Release(ctx context.Context, acquired *Lease) error
     Observe(ctx context.Context) (Observation, error)
-    Timing() LeaseTiming // Immutable configuration metadata; no S3 I/O.
+    Timing() Timing // Immutable configuration metadata; no S3 I/O.
 }
 
-type LeaseTiming struct {
+type Timing struct {
     LeaseDuration  time.Duration
     RenewDeadline  time.Duration
     RequestTimeout time.Duration
 }
 
-type Handle struct { /* unexported authority, proposal, and timing state */ }
+type Lease struct { /* unexported authority and timing state */ }
 
-func (h *Handle) EpochID() uint64
-func (h *Handle) ValidUntil() time.Time
-func (h *Handle) Done() <-chan struct{}
-func (h *Handle) Check() error
+func (l *Lease) EpochID() uint64
+func (l *Lease) ValidUntil() time.Time
+func (l *Lease) Done() <-chan struct{}
+func (l *Lease) Check() error
 
 type Observation struct {
     LeaseUID   string
@@ -522,16 +522,16 @@ type Observation struct {
 }
 ```
 
-`NewLease(LeaseConfig)` validates configuration and returns a bound core instance. `Timing()` exposes immutable timing metadata so recipe constructors can validate their schedules without duplicating or changing core settings. `clock.Clock` denotes an injectable monotonic-capable clock abstraction. Caller-supplied `ClientID` is stable; the library does not regenerate it on restart. Logical clients should have different IDs, but identity equality never authorizes grant adoption.
+`New(Config)` validates configuration and returns a bound Client. `Timing()` exposes immutable timing metadata so recipe constructors can validate their schedules without duplicating or changing core settings. `clock.Clock` denotes an injectable monotonic-capable clock abstraction. Caller-supplied `ClientID` is stable; the library does not regenerate it on restart. Logical clients should have different IDs, but identity equality never authorizes lease adoption.
 
 | Method | Success contract | Blocking / recovery behavior |
 | --- | --- | --- |
-| `Require` | Returns a new opaque grant only after a timely explicit acquisition success | One logical attempt with bounded I/O; no wait-until-unlocked loop; `ErrNotEligible`, conflict, or unknown outcome returns no grant |
-| `Renew` | Confirms one renewal and advances its existing grant deadline using the fixed proposal time | A later call retries/reconciles an unresolved renewal exactly; no automatic background renewal |
+| `Require` | Returns a new Lease only after a timely explicit acquisition success | One logical attempt with bounded I/O; no wait-until-unlocked loop; `ErrNotEligible`, conflict, or unknown outcome returns no Lease |
+| `Renew` | Confirms one renewal and advances its existing Lease deadline using the fixed proposal time | A later call retries/reconciles an unresolved renewal exactly; no automatic background renewal |
 | `Release` | Confirms a released record after retiring local authority | Caller must first join work; unresolved release retries are exact and remain within the original budget |
 | `Observe` | Returns a validated current snapshot and updates local eligibility observations | One bounded read; no watcher and no authority restoration |
 
-Handle internals cannot be constructed from an observation, serialized for recovery, or used with another Lease instance. `Check` synchronously rejects expired, lost, released, or otherwise retired grants, even if the timer has not yet run. `Done` closes once on retirement; it is a local cancellation signal, not revocation of remote side effects. `ValidUntil` is diagnostic and must not be edited by callers. Copies of the pointer share the same local owner and mutation serialization; they are not new grants.
+Lease internals cannot be constructed from an observation, serialized for recovery, or used with another Client. `Check` synchronously rejects an expired, lost, released, or otherwise retired lease, even if the timer has not yet run. `Done` closes once on retirement; it is a local cancellation signal, not revocation of remote side effects. `ValidUntil` is diagnostic and must not be edited by callers. Copies of the pointer refer to the same acquisition; they are not new leases.
 
 The core rejects concurrent mutations on one instance with `ErrConcurrentMutation`. It rejects `Require` while its active grant exists with `ErrAlreadyHeld`; callers must not infer these errors mean renewed authority. A request context bounds that call only. Recipes link application cancellation to work shutdown and optional release. Direct core users must arrange their own renewal schedule, cancellation, joining, and fencing.
 
@@ -540,7 +540,7 @@ The core rejects concurrent mutations on one instance with `ErrConcurrentMutatio
 ```go
 // In package recipes/leaderelection.
 type Config struct {
-    Lease           lease.Lease
+    Client          lease.Client
     RetryPeriod     time.Duration
     ObserveInterval time.Duration
     ShutdownTimeout time.Duration
@@ -630,7 +630,7 @@ Preserve cleanup or work errors alongside the primary cause using Go error wrapp
 ```go
 // In package recipes/mutex; constructors validate timing against the core.
 type Config struct {
-    Lease           lease.Lease
+    Client          lease.Client
     RetryPeriod     time.Duration
     ObserveInterval time.Duration
     ShutdownTimeout time.Duration
@@ -643,7 +643,7 @@ func (m *Mutex) WithLock(ctx context.Context,
 
 The first lock API is scoped `WithLock`: retry `Require` until a grant is obtained or the caller stops; start automatic `Renew`; run the tracked function; stop renewal and join work before release. Successful acquisition does not make arbitrary external side effects safe: pass the epoch to the resource's fencing protocol where required.
 
-On work-function return while the caller is active and the grant remains valid, always attempt safe release. On caller cancellation, use `ReleaseOnCancel` (default false). Handle loss or work-join timeout follows the same fail-closed behavior as election. Return `ErrLeaseLost` for lost authority and `ErrWorkNotStopped` for a failed join. Both recipes may share an internal lifecycle runner, but all storage authority remains in the core.
+On work-function return while the caller is active and the lease remains valid, always attempt safe release. On caller cancellation, use `ReleaseOnCancel` (default false). Lease loss or work-join timeout follows the same fail-closed behavior as election. Return `ErrLeaseLost` for lost authority and `ErrWorkNotStopped` for a failed join. Both recipes may share an internal lifecycle runner, but all storage authority remains in the core.
 
 One Mutex instance permits one active invocation; overlapping calls return `ErrRecipeBusy`, with no local FIFO queue. Sequential reuse is allowed after prior work has joined and any prior grant has been released or retired. A call made while a previous abandoned grant is still locally active also returns `ErrRecipeBusy`; it must not silently reuse that grant. An idle occupied record from an unknown outcome may delay the next acquisition normally. Fairness, reentrancy, and manual `Lock`/`Unlock` APIs are deferred; direct primitive users can compose `Require`/`Renew`/`Release` with their own completion barrier.
 
@@ -670,14 +670,14 @@ Error categories are proposed contracts; concrete exported names must remain con
 1. The S3 adapter performs only conditional lease mutations; recipes never bypass the core with direct writes.
 2. Only timely explicit success from `Require` creates a local grant. GET, observation callbacks, and matching client IDs cannot create or restore it.
 3. Takeover of an occupied record requires the observed record's full local observation interval and a successful CAS.
-4. Handle expiry or loss retires local authority. Recipes stop admission and cancel work without waiting for follower notifications; late responses cannot revive it.
+4. Lease expiry or loss retires local authority. Recipes stop admission and cancel work without waiting for follower notifications; late responses cannot revive it.
 5. Epochs increase on successful acquisition, remain unchanged on renewal/release, and never reset or wrap within the lease lifetime.
 6. Resource-fenced applications atomically validate the acquired epoch with their mutations and activate it before ordinary protected work. The core does not enforce another system's fence.
 7. Unknown outcomes follow the operation-specific contract. An unconfirmed acquisition may occupy a record without starting work; this is an availability gap, not authority to infer success.
 8. Live lease records are not deleted or restored to old contents. Their address, UID, and token history remain stable.
 9. Each new renewal or release increments sequence; exact retries retain the pair, contents, condition, and `firstSendAt`. Reacquisition increments epoch and resets sequence to 1.
 10. One local mutation owner controls each grant; no new logical mutation is submitted while its predecessor remains unresolved. GET reconciliation is allowed only within a confirmed grant, never to claim acquisition.
-11. A restarted holder keeps its logical client ID but must acquire a higher epoch. Lease handles cannot be restored from disk or transferred to another core instance.
+11. A restarted holder keeps its logical client ID but must acquire a higher epoch. Acquired leases cannot be restored from disk or transferred to another Client.
 12. Confirmation never refreshes a proposal's first-send reference. Both the old validity deadline and the proposal deadline must permit a renewal confirmation.
 13. Release requires quiescent protected work. A work-join timeout or unknown release never permits revival or replacement local work while the old task remains active.
 14. Observation notifications are ordered local snapshots that may skip transitions, not a complete history, simultaneous broadcast, readiness signal, or work authorization.
@@ -760,7 +760,7 @@ Keep per-mutation tuples out of metric labels; record them in logs. Expose epoch
 - Test `Timing()` immutability, concurrent mutation rejection, active-grant `Require` rejection, and foreign/expired/retired grant rejection.
 - Reproduce the Section 6.1 t=1/t=18 renewal example and the no-confirmation-before-t=20 branch; also race old timer completion with successful renewal.
 - Test recipe callback return, cancellation, grant loss, bounded work joining, single-use Elector, scoped Mutex reuse, and error preservation.
-- Verify a zero-value or copied/serialized grant representation cannot manufacture authority; only a returned handle is accepted by its creating core instance.
+- Verify a zero-value or copied/serialized Lease cannot manufacture authority; only a value returned by `Require` is accepted by its creating Client.
 
 ### 13.2 Failure and Safety Tests
 
@@ -1042,7 +1042,7 @@ This appendix records context, not additional protocol requirements or first-rel
 | `OnNewLeader` | Recipe `OnLeaderObserved`, with snapshot and coalescing semantics |
 | Core `FencingMode` | Removed; application-owned resource enforcement |
 | Monolithic Elector package | Store adapter, Lease core, then election/mutex recipes |
-| `Grant` type | `Handle` in package `lease` (a lease handle); naming clarification, no protocol change |
+| `Grant` / `Handle` type | `Lease` returned by a reusable `Client`; naming clarification, no protocol change |
 
 Raft terminology is only an analogy. Raft terms advance when elections begin, including unsuccessful elections; this epoch advances on a committed ownership grant. A lease sequence resets per epoch and is not Raft's cross-term log index. Raft's core election uses node identities and terms; client sessions and command deduplication belong to a separate layer and need not end on a leader change. See the [Raft paper](https://raft.github.io/raft.pdf) and [.NEXT client-interaction documentation](https://dotnet.github.io/dotNext/features/cluster/raft.html#client-interaction).
 

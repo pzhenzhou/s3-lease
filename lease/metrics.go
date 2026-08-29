@@ -32,8 +32,8 @@ type OperationMetric struct {
 	Duration  time.Duration
 }
 
-// GrantMetric is a point-in-time snapshot of process-local authority.
-type GrantMetric struct {
+// LeaseMetric is a point-in-time snapshot of an acquired lease.
+type LeaseMetric struct {
 	Key        Key
 	ClientID   string
 	Held       bool
@@ -52,10 +52,10 @@ type ObservationMetric struct {
 	ConfirmedRenewAge time.Duration
 }
 
-// Metrics is a process-lifetime observability service consumed by a Lease.
+// Metrics is a process-lifetime observability service consumed by a Client.
 // Event values are call-scoped and must not be mutated by the receiver.
 type Metrics interface {
 	OperationCompleted(OperationMetric)
-	GrantChanged(GrantMetric)
+	LeaseChanged(LeaseMetric)
 	ObservationUpdated(ObservationMetric)
 }
