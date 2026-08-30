@@ -1,4 +1,5 @@
-// Package s3store adapts the AWS SDK for Go v2 to lease.LeaseStore.
+// Package s3store adapts the AWS SDK for Go v2 to the parent lease package's
+// backend-neutral LeaseStore contract.
 package s3store
 
 import (

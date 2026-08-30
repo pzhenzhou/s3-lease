@@ -2,14 +2,14 @@
 
 ## Architecture and Priorities
 
-Correctness and concurrency safety take priority over convenience and performance. The API is hierarchical: `lease/` provides the backend-neutral coordination core, while `recipes/leaderelection/` and `recipes/mutex/` build higher-level workflows from it. `s3store/` adapts AWS SDK types to the core, and `examples/fencedmanifest/` demonstrates application-level fencing. Treat `docs/s3_lease_high_level_design_en.md` as the safety and protocol reference.
+Correctness and concurrency safety take priority over convenience and performance. The API is hierarchical: `lease/` provides the backend-neutral coordination core, while `recipes/leaderelection/` and `recipes/mutex/` build higher-level workflows from it. `lease/s3store/` adapts AWS SDK types to the core, and `examples/fencedmanifest/` demonstrates application-level fencing. Treat `docs/s3_lease_high_level_design_en.md` as the safety and protocol reference.
 
 Keep storage details out of the core and coordination policy out of storage adapters. A locally held lease is not sufficient protection for external writes; propagate and enforce fencing epochs where required.
 
 ## Project Structure
 
 - `lease/`: records, errors, metrics, public contracts, and protocol state.
-- `s3store/`: S3 conditional-write adapter.
+- `lease/s3store/`: S3 conditional-write adapter.
 - `recipes/`: leader-election and mutex workflows; shared private code lives in `recipes/internal/`.
 - `examples/`: integration patterns.
 - `docs/`: architecture, invariants, and planned E2E design.
@@ -69,7 +69,7 @@ type Clock interface {
 }
 ```
 
-`s3store` satisfies `LeaseStore` without leaking AWS types into `lease`; a real or fake clock satisfies `Clock` without exposing timer implementation.
+`lease/s3store` satisfies `LeaseStore` without leaking AWS types into the parent `lease` package; a real or fake clock satisfies `Clock` without exposing timer implementation.
 
 ### Design and Refactoring Principles
 

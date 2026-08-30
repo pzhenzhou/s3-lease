@@ -25,6 +25,10 @@ type Policy struct {
 	OnStarted           func()
 	OnStopped           func()
 	OnShutdown          func(duration time.Duration, timedOut bool)
+	// FatalErrors carries terminal errors from auxiliary holder activity, such
+	// as elected-state observation. The channel must not be closed while Run is
+	// active; a nil channel disables this input.
+	FatalErrors <-chan error
 }
 
 type renewalResult struct {
@@ -90,6 +94,13 @@ running:
 			cause = stopLeaseLost
 			primary = errors.Join(policy.LossError, acquired.Check())
 			break running
+		case fatalErr := <-policy.FatalErrors:
+			if fatalErr == nil {
+				continue
+			}
+			cause = stopFatal
+			primary = fatalErr
+			break running
 		case <-renewTimer.C:
 			if renewing {
 				continue
@@ -117,13 +128,16 @@ running:
 			case errors.Is(result.err, lease.ErrUnknownOutcome):
 				renewalPending = true
 				resetTimer(renewTimer, policy.RetryPeriod)
+			case retryable(result.err):
+				// A transient reconciliation failure leaves the exact frozen
+				// proposal unresolved. Keep reconciling it until authority ends;
+				// never create a fresh renewal while its outcome is unknown.
+				renewalPending = result.resolving
+				resetTimer(renewTimer, policy.RetryPeriod)
 			case result.resolving:
 				cause = stopFatal
 				primary = result.err
 				break running
-			case retryable(result.err):
-				renewalPending = false
-				resetTimer(renewTimer, policy.RetryPeriod)
 			case isLeaseLoss(result.err):
 				cause = stopLeaseLost
 				primary = errors.Join(policy.LossError, result.err)
@@ -212,7 +226,14 @@ running:
 	if err := acquired.Check(); err != nil {
 		return errors.Join(primary, renewalErr, policy.LossError, err)
 	}
-	return errors.Join(primary, renewalErr, policy.Client.Release(cleanupCtx, acquired))
+	releaseErr := policy.Client.Release(cleanupCtx, acquired)
+	// Once Release has frozen an uncertain proposal, subsequent Release calls
+	// can only reconcile that exact proposal in the core. Bound reconciliation
+	// by both the original authority deadline and a small attempt count.
+	for attempt := 1; attempt < 3 && errors.Is(releaseErr, lease.ErrUnknownOutcome) && cleanupCtx.Err() == nil; attempt++ {
+		releaseErr = policy.Client.Release(cleanupCtx, acquired)
+	}
+	return errors.Join(primary, renewalErr, releaseErr)
 }
 
 // stoppedRenewalState reports whether shutdown may safely issue the one

@@ -8,7 +8,7 @@ E2E_PROJECT ?= s3-lease-e2e
 
 .DEFAULT_GOAL := help
 
-.PHONY: help all fmt vet build test test-race e2e-up e2e-down e2e docker-build docker-buildx
+.PHONY: help all fmt vet build test test-race e2e-up e2e-down e2e e2e-race docker-build docker-buildx
 
 help: ## Show available targets.
 	@awk 'BEGIN {FS = ":.*## "; printf "Usage: make <target>\n\nTargets:\n"} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-16s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -42,6 +42,13 @@ e2e: ## Run tagged tests against a disposable SeaweedFS fixture.
 	$(MAKE) --no-print-directory e2e-up; \
 	$(MAKE) --no-print-directory docker-build; \
 	S3_LEASE_E2E_CANDIDATE_IMAGE='$(IMG)' go test -tags=e2e -count=1 -timeout=10m ./test/e2e/...
+
+e2e-race: ## Run tagged host-side tests with the race detector.
+	@set -eu; \
+	trap '$(MAKE) --no-print-directory e2e-down' EXIT INT TERM; \
+	$(MAKE) --no-print-directory e2e-up; \
+	$(MAKE) --no-print-directory docker-build; \
+	S3_LEASE_E2E_CANDIDATE_IMAGE='$(IMG)' go test -race -tags=e2e -count=1 -timeout=15m ./test/e2e/...
 
 docker-build: ## Build and load the current-platform E2E candidate image.
 	$(CONTAINER_TOOL) buildx build --load -t $(IMG) .

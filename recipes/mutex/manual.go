@@ -372,3 +372,18 @@ func manualCleanupContext(parent context.Context, deadline time.Time) (context.C
 	ctx, cancel := context.WithDeadline(parent, deadline)
 	return ctx, cancel, true
 }
+
+func resetTimer(timer *time.Timer, period time.Duration) {
+	stopTimer(timer)
+	timer.Reset(schedule.Delay(period))
+}
+
+func stopTimer(timer *time.Timer) {
+	if timer == nil || timer.Stop() {
+		return
+	}
+	select {
+	case <-timer.C:
+	default:
+	}
+}

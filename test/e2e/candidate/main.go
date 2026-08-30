@@ -15,9 +15,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/pzhenzhou/s3-lease/lease"
+	"github.com/pzhenzhou/s3-lease/lease/s3store"
 	"github.com/pzhenzhou/s3-lease/pkg/common"
 	"github.com/pzhenzhou/s3-lease/recipes/mutex"
-	"github.com/pzhenzhou/s3-lease/s3store"
 	"go.uber.org/zap"
 )
 
@@ -37,6 +37,8 @@ type options struct {
 	shutdownTimeout time.Duration
 	holdDuration    time.Duration
 	cancelAfter     time.Duration
+	workBehavior    string
+	observerDelay   time.Duration
 	release         bool
 	releaseOnCancel bool
 	productionLog   bool
@@ -62,7 +64,7 @@ func main() {
 
 func parseFlags() options {
 	var settings options
-	flag.StringVar(&settings.mode, "mode", "core", "candidate mode: core or mutex")
+	flag.StringVar(&settings.mode, "mode", "core", "candidate mode: core, mutex, or election")
 	flag.StringVar(&settings.endpoint, "endpoint", "http://127.0.0.1:8333", "S3 endpoint")
 	flag.StringVar(&settings.region, "region", "us-east-1", "AWS signing region")
 	flag.StringVar(&settings.bucket, "bucket", "lease-tests", "lease bucket")
@@ -77,6 +79,8 @@ func parseFlags() options {
 	flag.DurationVar(&settings.shutdownTimeout, "shutdown-timeout", 3*time.Second, "mutex work join timeout")
 	flag.DurationVar(&settings.holdDuration, "hold-duration", 5*time.Second, "bounded holding duration")
 	flag.DurationVar(&settings.cancelAfter, "cancel-after", 0, "cancel a mutex lifecycle after work starts")
+	flag.StringVar(&settings.workBehavior, "work-behavior", "cooperative", "work behavior: cooperative, error, or noncooperative")
+	flag.DurationVar(&settings.observerDelay, "observer-delay", 0, "delay each election observation callback")
 	flag.BoolVar(&settings.release, "release", true, "release after the hold duration")
 	flag.BoolVar(&settings.releaseOnCancel, "release-on-cancel", false, "release a mutex after canceled work joins")
 	flag.BoolVar(&settings.productionLog, "production-log", true, "emit production JSON logs")
@@ -93,22 +97,26 @@ func run(ctx context.Context, settings options, logger *zap.Logger) (err error) 
 	if settings.key == "" || settings.clientID == "" {
 		return errors.New("key and client-id are required")
 	}
-	if settings.holdDuration <= 0 || settings.cancelAfter < 0 {
-		return errors.New("hold-duration must be positive and cancel-after must not be negative")
+	if settings.holdDuration <= 0 || settings.cancelAfter < 0 || settings.observerDelay < 0 {
+		return errors.New("hold-duration must be positive and callback delays must not be negative")
 	}
-	if settings.mode != "core" && settings.mode != "mutex" {
-		return errors.New("mode must be core or mutex")
+	if settings.mode != "core" && settings.mode != "mutex" && settings.mode != "election" {
+		return errors.New("mode must be core, mutex, or election")
 	}
 	if settings.mode == "core" && settings.renewPeriod <= 0 {
 		return errors.New("renew-period must be positive")
 	}
-	if settings.mode == "mutex" &&
+	if (settings.mode == "mutex" || settings.mode == "election") &&
 		(settings.retryPeriod <= 0 || settings.observeInterval <= 0 || settings.shutdownTimeout <= 0) {
-		return errors.New("mutex timing values must be positive")
+		return errors.New("recipe timing values must be positive")
+	}
+	if settings.workBehavior != "cooperative" && settings.workBehavior != "error" && settings.workBehavior != "noncooperative" {
+		return errors.New("work-behavior must be cooperative, error, or noncooperative")
 	}
 	awsConfig, err := awsconfig.LoadDefaultConfig(ctx,
 		awsconfig.WithRegion(settings.region),
 		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("lease-dev", "local-test-only", "")),
+		awsconfig.WithRetryer(func() aws.Retryer { return aws.NopRetryer{} }),
 	)
 	if err != nil {
 		return fmt.Errorf("load AWS config: %w", err)
@@ -136,6 +144,9 @@ func run(ctx context.Context, settings options, logger *zap.Logger) (err error) 
 	}
 	if settings.mode == "mutex" {
 		return runMutex(ctx, settings, leaseClient, logger)
+	}
+	if settings.mode == "election" {
+		return runElection(ctx, settings, leaseClient, logger)
 	}
 	return runCore(ctx, settings, leaseClient, logger)
 }

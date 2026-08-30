@@ -12,8 +12,8 @@ import (
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/pzhenzhou/s3-lease/lease"
 	"github.com/pzhenzhou/s3-lease/pkg/common"
+	"github.com/pzhenzhou/s3-lease/recipes/internal/acquire"
 	"github.com/pzhenzhou/s3-lease/recipes/internal/holder"
-	"github.com/pzhenzhou/s3-lease/recipes/internal/schedule"
 	"go.uber.org/zap"
 )
 
@@ -141,40 +141,11 @@ func (m *Mutex) WithLock(ctx context.Context, work Work) (err error) {
 }
 
 func (m *Mutex) acquire(ctx context.Context) (*lease.Lease, error) {
-	acquired, err := m.config.Client.Require(ctx)
-	if err == nil {
-		return acquired, nil
-	}
-	if !acquisitionRetryable(ctx, err) {
-		return nil, err
-	}
-
-	retryTimer := time.NewTimer(schedule.Delay(m.config.RetryPeriod))
-	observeTimer := time.NewTimer(schedule.Delay(m.config.ObserveInterval))
-	defer stopTimer(retryTimer)
-	defer stopTimer(observeTimer)
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-retryTimer.C:
-			acquired, err = m.config.Client.Require(ctx)
-			if err == nil {
-				return acquired, nil
-			}
-			if !acquisitionRetryable(ctx, err) {
-				return nil, err
-			}
-			resetTimer(retryTimer, m.config.RetryPeriod)
-			resetTimer(observeTimer, m.config.ObserveInterval)
-		case <-observeTimer.C:
-			_, err = m.config.Client.Observe(ctx)
-			if err != nil && !observationRetryable(ctx, err) {
-				return nil, err
-			}
-			resetTimer(observeTimer, m.config.ObserveInterval)
-		}
-	}
+	return acquire.Run(ctx, acquire.Config{
+		Client:          m.config.Client,
+		RetryPeriod:     m.config.RetryPeriod,
+		ObserveInterval: m.config.ObserveInterval,
+	})
 }
 
 func (m *Mutex) enter() bool {
@@ -215,19 +186,6 @@ func (m *Mutex) logError(err error) {
 	}
 }
 
-func acquisitionRetryable(ctx context.Context, err error) bool {
-	if ctx.Err() != nil {
-		return false
-	}
-	return errors.Is(err, lease.ErrNotEligible) || errors.Is(err, lease.ErrConflict) ||
-		errors.Is(err, lease.ErrUnknownOutcome) || errors.Is(err, lease.ErrUnavailable) ||
-		errors.Is(err, context.DeadlineExceeded)
-}
-
-func observationRetryable(ctx context.Context, err error) bool {
-	return acquisitionRetryable(ctx, err) || errors.Is(err, lease.ErrNotFound)
-}
-
 func isNil(value any) bool {
 	if value == nil {
 		return true
@@ -238,20 +196,5 @@ func isNil(value any) bool {
 		return v.IsNil()
 	default:
 		return false
-	}
-}
-
-func resetTimer(timer *time.Timer, period time.Duration) {
-	stopTimer(timer)
-	timer.Reset(schedule.Delay(period))
-}
-
-func stopTimer(timer *time.Timer) {
-	if timer == nil || timer.Stop() {
-		return
-	}
-	select {
-	case <-timer.C:
-	default:
 	}
 }

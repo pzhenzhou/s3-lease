@@ -435,7 +435,7 @@ Token ordering is scoped to one lease's bucket/key and lifetime. Tokens from ind
 | --- | --- |
 | `lease/record.go`, `lease/core.go` | Record schema, acquired leases, deadline checks, local retirement |
 | `lease/lease.go` | `Require`, `Renew`, `Release`, `Observe`, eligibility and unresolved proposals |
-| `lease/store.go`, `lease/s3store.go` | Replaceable store contract and AWS SDK for Go v2 adapter |
+| `lease/api.go`, `lease/s3store/` | Replaceable store contract and AWS SDK for Go v2 adapter |
 | `lease/errors.go`, `lease/metrics.go` | Core error categories and request/grant metrics |
 | `recipes/leaderelection/` | Election retries, renewal, observation callbacks, work lifecycle |
 | `recipes/mutex/` | Scoped distributed-lock recipe and automatic renewal |
@@ -577,6 +577,35 @@ stateDiagram-v2
 *Figure 2. Election recipe lifecycle. Core calls implement each storage transition.*
 
 An Elector is single-use: concurrent or subsequent `Run` calls return `ErrRunAlreadyUsed`. Create a new Elector for a new lifecycle, only after prior work has joined. There is no public `TakeLeader`, force-adopt, or Watch API in the first release.
+
+#### Compatibility boundary and related mechanisms
+
+This recipe is a semantic analogue of the classic
+[client-go implementation](https://github.com/kubernetes/client-go/blob/master/tools/leaderelection/leaderelection.go),
+not an API, wire, or behavioral compatibility layer.
+
+| Behavior | This recipe | Classic client-go |
+| --- | --- | --- |
+| Expiry | Locally measured unchanged S3 record duration | Locally measured unchanged resource-lock record duration |
+| Acquisition | A confirmed conditional S3 write returns a process-local grant | A successful resource-lock create/update establishes local leadership |
+| Same-ID restart | Must acquire a higher epoch; stored ownership is never adopted | May recognize the configured holder identity as itself |
+| Start callback | Tracked work returns an error and joins children before returning | Started asynchronously and not joined by the elector |
+| Stop callback | Asynchronous and exactly once only after work started | Called whenever `Run` exits, including without acquisition |
+| Observation | Explicit polling snapshots, serial and coalesced | `OnNewLeader` derives from acquire/renew observations |
+| Release | Empty owner with stable UID and preserved epoch history | Writes a Kubernetes release-shaped election record |
+| Fencing | Exposes the epoch for protected-resource enforcement | Explicitly does not guarantee fencing |
+| Additional APIs | Omits leader getters, health checking, and lock variants | Includes `GetLeader`, `IsLeader`, watchdog, and resource-lock integration |
+| Coordinated election | Not supported | Also contains an alpha coordinated mode |
+
+The mechanism also differs from etcd's session-backed
+[`Campaign`/`Observe`/`Resign` API](https://pkg.go.dev/go.etcd.io/etcd/client/v3/concurrency):
+this S3 design polls one durable object and owns local unchanged-record timing,
+whereas etcd elections are built on sessions, ordered revisions, and watches.
+ZooKeeper's
+[leader-election recipe](https://zookeeper.apache.org/doc/current/recipes.html#sc_leaderElection)
+uses ephemeral sequential znodes and predecessor watches to avoid a herd effect;
+this design instead uses a stable S3 key, conditional writes, and monotonically
+preserved fencing epochs.
 
 ### 8.4 Observation and Notification Contract
 

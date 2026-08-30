@@ -21,3 +21,11 @@ type Metrics interface {
 	ObservationCoalesced()
 	WorkShutdown(ShutdownMetric)
 }
+
+type noopMetrics struct{}
+
+func (noopMetrics) LeaderChanged(LeaderMetric) {}
+
+func (noopMetrics) ObservationCoalesced() {}
+
+func (noopMetrics) WorkShutdown(ShutdownMetric) {}

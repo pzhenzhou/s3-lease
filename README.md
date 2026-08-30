@@ -2,8 +2,8 @@
 
 `s3-lease` coordinates distributed workloads through one authoritative S3
 object. It provides the backend-neutral lease core, the AWS SDK for Go v2
-adapter, and a scoped distributed-mutex recipe with blocking acquisition and
-automatic renewal. Leader-election behavior is still planned.
+adapter, a scoped distributed-mutex recipe, and a single-use leader-election
+recipe with blocking acquisition and automatic renewal.
 
 The protocol uses conditional S3 writes and opaque ETags. A confirmed lease's
 epoch is a fencing token, but the application must persist and enforce that
@@ -117,6 +117,47 @@ caller must stop and join its own protected work before calling `Release`.
 Passing the acquisition-scoped `*mutex.Lock` prevents a delayed release from
 retiring a newer acquisition. Contention returns the core acquisition error
 immediately; `TryLock` never enters the `WithLock` retry loop.
+
+## Run a leader election
+
+```go
+elector, err := leaderelection.New(leaderelection.Config{
+    Client:          client,
+    RetryPeriod:     3 * time.Second,
+    ObserveInterval: 2 * time.Second,
+    ShutdownTimeout: 5 * time.Second,
+    ReleaseOnCancel: false,
+    Callbacks: leaderelection.Callbacks{
+        OnStartedLeading: func(workCtx context.Context, epochID uint64) error {
+            // Activate epochID at each protected resource before ordinary work.
+            return runLeaderWork(workCtx, epochID)
+        },
+        OnStoppedLeading: func() {
+            notifyLocalShutdown()
+        },
+        OnLeaderObserved: func(callbackCtx context.Context, observation lease.Observation) {
+            reportSnapshot(observation) // Informational only; never grants authority.
+        },
+    },
+})
+if err != nil {
+    return err
+}
+return elector.Run(ctx)
+```
+
+An `Elector` is single-use. Leader work starts only after a confirmed grant is
+rechecked, receives the epoch as its fencing token, and is canceled and joined
+before a safe optional release. Work return ends the run; the elector never
+reacquires. Observation callbacks are serial and coalesced polling snapshots,
+not readiness or authority signals.
+
+The API is a semantic analogue of classic Kubernetes client-go election, not a
+drop-in implementation. In particular, a same-ID restart must acquire a higher
+epoch, leader work is tracked and joined, and `OnStoppedLeading` is called only
+after work actually started. APIs such as `GetLeader`, `IsLeader`, health
+watchdogs, resource-lock variants, and coordinated election are intentionally
+not provided.
 
 `common.InitLogger(true)` installs one process-wide production Zap logger using
 JSON at Info level. Passing `false` installs the console development logger at
