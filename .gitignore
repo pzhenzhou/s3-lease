@@ -14,8 +14,8 @@ Dockerfile.cross
 .cursorrules
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
-CLAUDE.md
-AGENTS.md
+# CLAUDE.md
+# AGENTS.md
 # Go workspace file
 go.work
 

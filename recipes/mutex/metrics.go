@@ -8,3 +8,9 @@ type Metrics interface {
 	LockChanged(held bool, epochID uint64)
 	WorkShutdown(duration time.Duration, timedOut bool)
 }
+
+type noopMetrics struct{}
+
+func (noopMetrics) LockChanged(bool, uint64) {}
+
+func (noopMetrics) WorkShutdown(time.Duration, bool) {}

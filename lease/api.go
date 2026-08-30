@@ -1,14 +1,15 @@
 // Package lease implements an S3-backed lease protocol.
 //
-// A Lease is bound to one storage backend, bucket, object key, and stable
+// A Client is bound to one storage backend, bucket, object key, and stable
 // client ID. Require performs one acquisition attempt; recipes provide retry
 // loops and automatic renewal.
 package lease
 
 import (
 	"context"
-	"log/slog"
 	"time"
+
+	"go.uber.org/zap"
 )
 
 const (
@@ -39,7 +40,9 @@ type StoredObject struct {
 // Version values exactly.
 type LeaseStore interface {
 	Get(ctx context.Context, key Key) (StoredObject, error)
-	Create(ctx context.Context, key Key, body []byte) (Version, error)
+	// CreateIfAbsent atomically creates key only when no current object exists.
+	// An existing object must be reported as a precondition failure or conflict.
+	CreateIfAbsent(ctx context.Context, key Key, body []byte) (Version, error)
 	CompareAndSwap(ctx context.Context, key Key, expected Version, body []byte) (Version, error)
 }
 
@@ -51,10 +54,10 @@ type Clock interface {
 	AfterFunc(delay time.Duration, fn func()) (stop func() bool)
 }
 
-// LeaseConfig is construction-scoped configuration. A Lease implementation
+// Config is construction-scoped configuration. A Client implementation
 // copies it at construction and treats it as immutable for that instance's
 // lifetime.
-type LeaseConfig struct {
+type Config struct {
 	Store          LeaseStore
 	Key            Key
 	ClientID       string
@@ -64,18 +67,18 @@ type LeaseConfig struct {
 	RequestTimeout time.Duration
 	Clock          Clock
 	Metrics        Metrics
-	Logger         *slog.Logger
+	Logger         *zap.Logger
 }
 
-// LeaseTiming is process-lifetime immutable configuration metadata.
-type LeaseTiming struct {
+// Timing is process-lifetime immutable configuration metadata.
+type Timing struct {
 	LeaseDuration  time.Duration
 	RenewDeadline  time.Duration
 	RequestTimeout time.Duration
 }
 
-// Observation is a read-scoped value snapshot. It may outlive its source Lease,
-// but it never grants authority and cannot reconstruct a Handle.
+// Observation is a read-scoped value snapshot. It may outlive its source
+// Client, but it never grants authority and cannot reconstruct a Lease.
 type Observation struct {
 	LeaseUID   string
 	ClientID   string
@@ -84,13 +87,13 @@ type Observation struct {
 	ReadAt     time.Time
 }
 
-// Lease is a process-local coordination service. One instance is bound to one
+// Client is a process-local coordination service. One instance is bound to one
 // store/key/client ID and may serve multiple sequential acquisitions. It must
 // not be copied or restored from persisted state.
-type Lease interface {
-	Require(ctx context.Context) (*Handle, error)
-	Renew(ctx context.Context, handle *Handle) error
-	Release(ctx context.Context, handle *Handle) error
+type Client interface {
+	Require(ctx context.Context) (*Lease, error)
+	Renew(ctx context.Context, acquired *Lease) error
+	Release(ctx context.Context, acquired *Lease) error
 	Observe(ctx context.Context) (Observation, error)
-	Timing() LeaseTiming
+	Timing() Timing
 }
