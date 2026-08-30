@@ -199,7 +199,3 @@ make docker-buildx \
   PLATFORMS=linux/amd64,linux/arm64
 ```
 
-See [the high-level design](docs/s3_lease_high_level_design_en.md) for the
-protocol and safety model, and
-[implementation status](docs/implementation_status.md) for delivered and
-deferred capabilities.
