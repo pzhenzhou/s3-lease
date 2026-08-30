@@ -1,9 +1,9 @@
 # s3-lease
 
 `s3-lease` coordinates distributed workloads through one authoritative S3
-object. The P0 implementation provides the backend-neutral lease core and the
-AWS SDK for Go v2 adapter. Higher-level mutex and leader-election behavior is
-still planned.
+object. It provides the backend-neutral lease core, the AWS SDK for Go v2
+adapter, and a scoped distributed-mutex recipe with blocking acquisition and
+automatic renewal. Leader-election behavior is still planned.
 
 The protocol uses conditional S3 writes and opaque ETags. A confirmed lease's
 epoch is a fencing token, but the application must persist and enforce that
@@ -53,6 +53,71 @@ loop. Direct users own renewal scheduling, work cancellation and joining, and
 optional release. `Done` closes on expiry or retirement, and no later storage
 response can revive that lease.
 
+## Run protected work with the mutex recipe
+
+```go
+lock, err := mutex.New(mutex.Config{
+    Client:          client,
+    RetryPeriod:     3 * time.Second,
+    ObserveInterval: 2 * time.Second,
+    ShutdownTimeout: 5 * time.Second,
+    ReleaseOnCancel: false,
+    Logger:          logger,
+})
+if err != nil {
+    return err
+}
+
+err = lock.WithLock(ctx, func(workCtx context.Context, epochID uint64) error {
+    // Activate and enforce epochID at the protected resource before writes.
+    return runProtectedWork(workCtx, epochID)
+})
+```
+
+`WithLock` retries until it confirms a grant, renews while the tracked work is
+running, and waits for that work to return before release. Normal completion
+always attempts a conditional release. Cancellation stops renewal immediately;
+with the default `ReleaseOnCancel: false`, the stored owner remains occupied
+until another participant observes that version unchanged for its advertised
+lease duration and wins a conditional takeover. Expiry does not write an
+unlocked record.
+
+One `Mutex` permits one active invocation and has no local FIFO queue. It can
+be reused after its prior work has joined and the prior grant has released or
+retired. `ErrWorkNotStopped` means work ignored cancellation, release was
+suppressed, and that `Mutex` must not be reused.
+
+The `Work` callback lets `WithLock` enforce cancellation and join-before-release
+without knowing how the application starts child tasks. Its context closes on
+caller cancellation or lease loss, its epoch argument is the resource fencing
+token, and its returned error is propagated from `WithLock`.
+
+Callers that own their lifecycle explicitly can instead use the non-blocking
+manual API:
+
+```go
+held, err := lock.TryLock(ctx) // Exactly one acquisition attempt.
+if err != nil {
+    return err
+}
+defer func() { _ = lock.Release(context.Background(), held) }()
+
+epoch := held.EpochID()
+select {
+case <-held.Done():
+    return held.Check()
+default:
+    return writeWithFence(epoch)
+}
+```
+
+A successful `TryLock` starts automatic renewal. Its call context bounds only
+the acquisition attempt; ownership continues until loss or `Release`. The
+caller must stop and join its own protected work before calling `Release`.
+Passing the acquisition-scoped `*mutex.Lock` prevents a delayed release from
+retiring a newer acquisition. Contention returns the core acquisition error
+immediately; `TryLock` never enters the `WithLock` retry loop.
+
 `common.InitLogger(true)` installs one process-wide production Zap logger using
 JSON at Info level. Passing `false` installs the console development logger at
 Debug level. Components use the shared logger when their `Logger` field is nil.
@@ -68,8 +133,8 @@ make test-race
 
 Local E2E uses Docker/Docker Compose only. It starts pinned SeaweedFS 4.44,
 waits for an S3 create/put/get readiness round trip, builds the test candidate
-image, runs the conditional-write and lease-core contracts, and removes the
-disposable Compose volume even when a test fails:
+image, runs the conditional-write, lease-core, and distributed-mutex
+contracts, and removes the disposable Compose volume even when a test fails:
 
 ```sh
 make e2e

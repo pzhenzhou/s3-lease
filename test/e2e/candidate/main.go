@@ -16,23 +16,30 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/pzhenzhou/s3-lease/lease"
 	"github.com/pzhenzhou/s3-lease/pkg/common"
+	"github.com/pzhenzhou/s3-lease/recipes/mutex"
 	"github.com/pzhenzhou/s3-lease/s3store"
 	"go.uber.org/zap"
 )
 
 type options struct {
-	endpoint       string
-	region         string
-	bucket         string
-	key            string
-	clientID       string
-	leaseDuration  time.Duration
-	renewDeadline  time.Duration
-	requestTimeout time.Duration
-	renewPeriod    time.Duration
-	holdDuration   time.Duration
-	release        bool
-	productionLog  bool
+	mode            string
+	endpoint        string
+	region          string
+	bucket          string
+	key             string
+	clientID        string
+	leaseDuration   time.Duration
+	renewDeadline   time.Duration
+	requestTimeout  time.Duration
+	renewPeriod     time.Duration
+	retryPeriod     time.Duration
+	observeInterval time.Duration
+	shutdownTimeout time.Duration
+	holdDuration    time.Duration
+	cancelAfter     time.Duration
+	release         bool
+	releaseOnCancel bool
+	productionLog   bool
 }
 
 func main() {
@@ -55,6 +62,7 @@ func main() {
 
 func parseFlags() options {
 	var settings options
+	flag.StringVar(&settings.mode, "mode", "core", "candidate mode: core or mutex")
 	flag.StringVar(&settings.endpoint, "endpoint", "http://127.0.0.1:8333", "S3 endpoint")
 	flag.StringVar(&settings.region, "region", "us-east-1", "AWS signing region")
 	flag.StringVar(&settings.bucket, "bucket", "lease-tests", "lease bucket")
@@ -64,8 +72,13 @@ func parseFlags() options {
 	flag.DurationVar(&settings.renewDeadline, "renew-deadline", 10*time.Second, "local renewal deadline")
 	flag.DurationVar(&settings.requestTimeout, "request-timeout", 2*time.Second, "per-request timeout")
 	flag.DurationVar(&settings.renewPeriod, "renew-period", time.Second, "renewal interval")
+	flag.DurationVar(&settings.retryPeriod, "retry-period", time.Second, "mutex acquisition and renewal interval")
+	flag.DurationVar(&settings.observeInterval, "observe-interval", 500*time.Millisecond, "mutex waiting observation interval")
+	flag.DurationVar(&settings.shutdownTimeout, "shutdown-timeout", 3*time.Second, "mutex work join timeout")
 	flag.DurationVar(&settings.holdDuration, "hold-duration", 5*time.Second, "bounded holding duration")
+	flag.DurationVar(&settings.cancelAfter, "cancel-after", 0, "cancel a mutex lifecycle after work starts")
 	flag.BoolVar(&settings.release, "release", true, "release after the hold duration")
+	flag.BoolVar(&settings.releaseOnCancel, "release-on-cancel", false, "release a mutex after canceled work joins")
 	flag.BoolVar(&settings.productionLog, "production-log", true, "emit production JSON logs")
 	flag.Parse()
 	return settings
@@ -80,8 +93,18 @@ func run(ctx context.Context, settings options, logger *zap.Logger) (err error) 
 	if settings.key == "" || settings.clientID == "" {
 		return errors.New("key and client-id are required")
 	}
-	if settings.renewPeriod <= 0 || settings.holdDuration <= 0 {
-		return errors.New("renew-period and hold-duration must be positive")
+	if settings.holdDuration <= 0 || settings.cancelAfter < 0 {
+		return errors.New("hold-duration must be positive and cancel-after must not be negative")
+	}
+	if settings.mode != "core" && settings.mode != "mutex" {
+		return errors.New("mode must be core or mutex")
+	}
+	if settings.mode == "core" && settings.renewPeriod <= 0 {
+		return errors.New("renew-period must be positive")
+	}
+	if settings.mode == "mutex" &&
+		(settings.retryPeriod <= 0 || settings.observeInterval <= 0 || settings.shutdownTimeout <= 0) {
+		return errors.New("mutex timing values must be positive")
 	}
 	awsConfig, err := awsconfig.LoadDefaultConfig(ctx,
 		awsconfig.WithRegion(settings.region),
@@ -111,6 +134,13 @@ func run(ctx context.Context, settings options, logger *zap.Logger) (err error) 
 	if err != nil {
 		return err
 	}
+	if settings.mode == "mutex" {
+		return runMutex(ctx, settings, leaseClient, logger)
+	}
+	return runCore(ctx, settings, leaseClient, logger)
+}
+
+func runCore(ctx context.Context, settings options, leaseClient lease.Client, logger *zap.Logger) error {
 	acquired, err := leaseClient.Require(ctx)
 	if err != nil {
 		return err
@@ -145,4 +175,45 @@ func run(ctx context.Context, settings options, logger *zap.Logger) (err error) 
 			return nil
 		}
 	}
+}
+
+func runMutex(ctx context.Context, settings options, leaseClient lease.Client, logger *zap.Logger) error {
+	lock, err := mutex.New(mutex.Config{
+		Client:          leaseClient,
+		RetryPeriod:     settings.retryPeriod,
+		ObserveInterval: settings.observeInterval,
+		ShutdownTimeout: settings.shutdownTimeout,
+		ReleaseOnCancel: settings.releaseOnCancel,
+		Logger:          logger,
+	})
+	if err != nil {
+		return err
+	}
+	lockCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	return lock.WithLock(lockCtx, func(workCtx context.Context, epochID uint64) error {
+		logger.Info("candidate_mutex_work_started",
+			zap.String("client_id", settings.clientID),
+			zap.Uint64("epoch_id", epochID))
+		var cancelTimer *time.Timer
+		if settings.cancelAfter > 0 {
+			cancelTimer = time.AfterFunc(settings.cancelAfter, cancel)
+			defer cancelTimer.Stop()
+		}
+		holdTimer := time.NewTimer(settings.holdDuration)
+		defer holdTimer.Stop()
+		select {
+		case <-workCtx.Done():
+			logger.Info("candidate_mutex_work_stopped",
+				zap.String("client_id", settings.clientID),
+				zap.Uint64("epoch_id", epochID),
+				zap.Error(workCtx.Err()))
+			return workCtx.Err()
+		case <-holdTimer.C:
+			logger.Info("candidate_mutex_work_completed",
+				zap.String("client_id", settings.clientID),
+				zap.Uint64("epoch_id", epochID))
+			return nil
+		}
+	})
 }

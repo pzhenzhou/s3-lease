@@ -639,13 +639,43 @@ type Config struct {
 
 func (m *Mutex) WithLock(ctx context.Context,
     work func(ctx context.Context, epochID uint64) error) error
+
+type Lock struct { /* acquisition-scoped manual authority */ }
+
+func (m *Mutex) TryLock(ctx context.Context) (*Lock, error)
+func (m *Mutex) Release(ctx context.Context, held *Lock) error
+func (l *Lock) EpochID() uint64
+func (l *Lock) ValidUntil() time.Time
+func (l *Lock) Done() <-chan struct{}
+func (l *Lock) Check() error
 ```
 
 The first lock API is scoped `WithLock`: retry `Require` until a grant is obtained or the caller stops; start automatic `Renew`; run the tracked function; stop renewal and join work before release. Successful acquisition does not make arbitrary external side effects safe: pass the epoch to the resource's fencing protocol where required.
 
 On work-function return while the caller is active and the lease remains valid, always attempt safe release. On caller cancellation, use `ReleaseOnCancel` (default false). Lease loss or work-join timeout follows the same fail-closed behavior as election. Return `ErrLeaseLost` for lost authority and `ErrWorkNotStopped` for a failed join. Both recipes may share an internal lifecycle runner, but all storage authority remains in the core.
 
-One Mutex instance permits one active invocation; overlapping calls return `ErrRecipeBusy`, with no local FIFO queue. Sequential reuse is allowed after prior work has joined and any prior grant has been released or retired. A call made while a previous abandoned grant is still locally active also returns `ErrRecipeBusy`; it must not silently reuse that grant. An idle occupied record from an unknown outcome may delay the next acquisition normally. Fairness, reentrancy, and manual `Lock`/`Unlock` APIs are deferred; direct primitive users can compose `Require`/`Renew`/`Release` with their own completion barrier.
+One Mutex instance permits one active invocation or manual acquisition;
+overlapping calls return `ErrRecipeBusy`, with no local FIFO queue. Sequential
+reuse is allowed after prior work has joined and any prior grant has been
+released or retired. A call made while a previous abandoned grant is still
+locally active also returns `ErrRecipeBusy`; it must not silently reuse that
+grant. An idle occupied record from an unknown outcome may delay the next
+acquisition normally. Fairness and reentrancy are deferred.
+
+`TryLock` is the non-blocking manual entry point. It performs exactly one core
+`Require` call and returns its contention or storage error immediately without
+entering the `WithLock` polling loop. A successful result starts automatic
+renewal and returns an acquisition-scoped `Lock`; the call context bounds only
+that acquisition attempt. Callers select on `Lock.Done`, use `Check` before
+admission, enforce `EpochID` at protected resources, and stop and join their
+own work before calling `Mutex.Release`.
+
+`Release` requires the exact `Lock` returned by that Mutex. This prevents a
+delayed release for an old epoch from retiring a newer local acquisition. It
+stops and joins the renewal loop, reconciles a known pending renewal within the
+original authority deadline, and then delegates the conditional mutation to
+the core. A bare blocking `Lock` method, parameterless `Unlock`, fairness, and
+reentrancy remain deferred.
 
 ### 8.7 Error Categories
 
@@ -661,6 +691,7 @@ One Mutex instance permits one active invocation; overlapping calls return `ErrR
 | Authentication failure, malformed record, UID change, or rollback | Stop participation and alert; never convert to absence |
 | Recipe `ErrLeadershipLost` / `ErrLeaseLost` | Stop admission, cancel and join work; no automatic return to the old epoch |
 | Recipe `ErrWorkNotStopped` | No release or replacement local work; require application containment |
+| Mutex `ErrRecipeBusy` / `ErrLockNotHeld` | Reject overlapping use or a foreign/stale manual handle; never redirect a delayed release to the current acquisition |
 | Resource `ErrFenced` | Reject the business mutation and stop affected work; it is not an S3 store error |
 
 Error categories are proposed contracts; concrete exported names must remain consistent in implementation. The adapter must follow the documented [S3 conditional-write response behavior](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html).
@@ -913,6 +944,7 @@ Mutex recipe scenarios:
 | L02 | Task runs longer than one advertised lease duration | Recipe calls core `Renew`; successful renewals preserve epoch and keep the task authorized |
 | L03 | Partition or pause the lock holder | Context is canceled on detected loss; task joins or reports timeout; resource fencing rejects old-token writes after successor activation |
 | L04 | Election and Mutex use the same key | They contend through the same core record; no recipe-specific key or token bypass; distinct keys remain independent |
+| L05 | Manual `TryLock` and `Release` | Contention returns after one failed acquisition attempt; a successful handle renews automatically; only that handle releases; reacquisition uses a higher epoch |
 
 For E08, use a protected manifest containing the accepted epoch, a resource revision, and a bounded history of activation/business-mutation IDs. The resource revision and business IDs are test-resource bookkeeping, not the lease's `sequenceID`. Update all manifest fields together through CAS. Assert against this committed history: once activation of epoch N is committed, no later committed mutation may carry an epoch below N.
 
@@ -1008,7 +1040,7 @@ This E2E decision supplements the production S3 architecture; it changes neither
 - Define the controlled recovery authority for lease loss and historical-version retention without permitting counter rollback.
 - Qualify a SeaweedFS image digest and the intended Versioning configuration; assign Linux CI and the real-AWS test account.
 
-Manual `Lock`/`Unlock`, fairness, replayable events, centralized fanout, administrative handoff, and a generic fencing framework are deferred. They must not delay validation of the core and the two scoped recipes.
+A bare blocking `Lock`/parameterless `Unlock`, fairness, replayable events, centralized fanout, administrative handoff, and a generic fencing framework are deferred. They must not delay validation of the core and the two scoped recipes.
 
 ## 15. References
 

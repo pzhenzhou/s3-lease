@@ -42,6 +42,13 @@ type Harness struct {
 	S3             *s3.Client
 }
 
+// Candidate is one independently running E2E candidate container. Wait must
+// be called exactly once.
+type Candidate struct {
+	command *exec.Cmd
+	output  *bytes.Buffer
+}
+
 func New(ctx context.Context) (*Harness, error) {
 	endpoint := envOr("S3_LEASE_E2E_ENDPOINT", defaultEndpoint)
 	region := envOr("S3_LEASE_E2E_REGION", defaultRegion)
@@ -133,6 +140,15 @@ func (h *Harness) Key(caseID string) string {
 }
 
 func (h *Harness) RunCandidate(ctx context.Context, args ...string) ([]byte, error) {
+	candidate, err := h.StartCandidate(ctx, args...)
+	if err != nil {
+		return nil, err
+	}
+	return candidate.Wait()
+}
+
+// StartCandidate starts the candidate image without waiting for it to exit.
+func (h *Harness) StartCandidate(ctx context.Context, args ...string) (*Candidate, error) {
 	if h.CandidateImage == "" {
 		return nil, errors.New("S3_LEASE_E2E_CANDIDATE_IMAGE is required; run through make e2e")
 	}
@@ -149,7 +165,20 @@ func (h *Harness) RunCandidate(ctx context.Context, args ...string) ([]byte, err
 	}
 	commandArgs = append(commandArgs, args...)
 	command := exec.CommandContext(ctx, h.ContainerTool, commandArgs...)
-	output, err := command.CombinedOutput()
+	output := &bytes.Buffer{}
+	command.Stdout = output
+	command.Stderr = output
+	if err := command.Start(); err != nil {
+		return nil, fmt.Errorf("start candidate: %w", err)
+	}
+	return &Candidate{command: command, output: output}, nil
+}
+
+// Wait waits for a candidate and returns all of its logs, including logs from
+// an expected failing lifecycle.
+func (c *Candidate) Wait() ([]byte, error) {
+	err := c.command.Wait()
+	output := append([]byte(nil), c.output.Bytes()...)
 	if err != nil {
 		return output, fmt.Errorf("candidate failed: %w: %s", err, output)
 	}

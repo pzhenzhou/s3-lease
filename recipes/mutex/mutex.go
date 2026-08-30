@@ -1,18 +1,25 @@
-// Package mutex defines a scoped distributed-lock recipe over the lease core.
+// Package mutex defines scoped and manual distributed-lock APIs over the lease
+// core.
 package mutex
 
 import (
 	"context"
 	"errors"
+	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/pzhenzhou/s3-lease/lease"
+	"github.com/pzhenzhou/s3-lease/pkg/common"
+	"github.com/pzhenzhou/s3-lease/recipes/internal/holder"
+	"github.com/pzhenzhou/s3-lease/recipes/internal/schedule"
 	"go.uber.org/zap"
 )
 
 var (
 	ErrRecipeBusy     = errors.New("mutex recipe is busy")
+	ErrLockNotHeld    = errors.New("mutex lock is not held")
 	ErrLeaseLost      = errors.New("mutex lease lost")
 	ErrWorkNotStopped = errors.New("mutex work did not stop")
 )
@@ -28,17 +35,223 @@ type Config struct {
 	Logger          *zap.Logger
 }
 
-// Work is invocation-scoped protected work.
+// Work is invocation-scoped protected work managed by WithLock. The context is
+// canceled when authority or the caller is lost, and epochID must be enforced
+// as a fencing token by protected resources that require stale-writer safety.
 type Work func(context.Context, uint64) error
 
-// Mutex is reusable sequentially. One WithLock lifecycle may be active at a
-// time; a work-join timeout makes the instance permanently busy.
-//
-// Planned public operation: WithLock(context.Context, Work) error.
+// Mutex is reusable sequentially. One WithLock lifecycle or manual Lock may be
+// active at a time; a work-join timeout makes the instance permanently busy.
 type Mutex struct {
 	config Config
 	// mu prevents concurrent WithLock lifecycles from both observing busy=false
 	// and starting protected work through the same reusable recipe instance.
 	mu   xsync.RBMutex
 	busy bool
+	// manual is non-nil only for a successful TryLock acquisition. Scoped
+	// WithLock work remains entirely owned by the holder lifecycle.
+	manual    *Lock
+	releasing bool
+}
+
+// New validates config and returns a reusable distributed mutex.
+func New(config Config) (_ *Mutex, err error) {
+	logger := config.Logger
+	if logger == nil {
+		logger = common.Logger()
+	}
+	logger.Debug("mutex construction started")
+	defer func() {
+		if err != nil {
+			logger.Error("mutex construction failed", zap.Error(err))
+		}
+	}()
+	if isNil(config.Client) {
+		return nil, fmt.Errorf("%w: lease client is required", lease.ErrInvalidConfig)
+	}
+	if config.RetryPeriod <= 0 || config.ObserveInterval <= 0 || config.ShutdownTimeout <= 0 {
+		return nil, fmt.Errorf("%w: mutex timing values must be positive", lease.ErrInvalidConfig)
+	}
+	timing := config.Client.Timing()
+	if timing.RenewDeadline <= config.RetryPeriod ||
+		timing.RenewDeadline-config.RetryPeriod <= config.RetryPeriod/5 {
+		return nil, fmt.Errorf("%w: renew deadline must exceed 1.2 times retry period", lease.ErrInvalidConfig)
+	}
+	if isNil(config.Metrics) {
+		config.Metrics = noopMetrics{}
+	}
+	config.Logger = logger
+	logger.Info("mutex constructed",
+		zap.Duration("retry_period", config.RetryPeriod),
+		zap.Duration("observe_interval", config.ObserveInterval),
+		zap.Duration("shutdown_timeout", config.ShutdownTimeout),
+		zap.Bool("release_on_cancel", config.ReleaseOnCancel))
+	return &Mutex{config: config}, nil
+}
+
+// WithLock waits for a confirmed lease, runs work under automatic renewal,
+// and releases only after the protected work has joined.
+func (m *Mutex) WithLock(ctx context.Context, work Work) (err error) {
+	if m == nil {
+		return fmt.Errorf("%w: nil mutex", lease.ErrInvalidConfig)
+	}
+	if ctx == nil {
+		return fmt.Errorf("%w: context is required", lease.ErrInvalidConfig)
+	}
+	if work == nil {
+		return fmt.Errorf("%w: work is required", lease.ErrInvalidConfig)
+	}
+	if !m.enter() {
+		return ErrRecipeBusy
+	}
+	m.config.Logger.Debug("mutex acquisition started")
+
+	acquired, err := m.acquire(ctx)
+	if err != nil {
+		m.clearBusy()
+		m.logError(err)
+		return err
+	}
+	epochID := acquired.EpochID()
+	err = holder.Run(ctx, acquired, holder.Work(work), holder.Policy{
+		Client:              m.config.Client,
+		RetryPeriod:         m.config.RetryPeriod,
+		ShutdownTimeout:     m.config.ShutdownTimeout,
+		ReleaseOnWorkReturn: true,
+		ReleaseOnCancel:     m.config.ReleaseOnCancel,
+		LossError:           ErrLeaseLost,
+		WorkNotStoppedError: ErrWorkNotStopped,
+		OnStarted: func() {
+			m.config.Metrics.LockChanged(true, epochID)
+			m.config.Logger.Info("mutex lock acquired", zap.Uint64("epoch_id", epochID))
+		},
+		OnStopped: func() {
+			m.config.Metrics.LockChanged(false, epochID)
+			m.config.Logger.Info("mutex protected work stopping", zap.Uint64("epoch_id", epochID))
+		},
+		OnShutdown: m.config.Metrics.WorkShutdown,
+	})
+	m.finish(acquired, err)
+	if err == nil {
+		m.config.Logger.Info("mutex lifecycle completed", zap.Uint64("epoch_id", epochID))
+	} else {
+		m.logError(err)
+	}
+	return err
+}
+
+func (m *Mutex) acquire(ctx context.Context) (*lease.Lease, error) {
+	acquired, err := m.config.Client.Require(ctx)
+	if err == nil {
+		return acquired, nil
+	}
+	if !acquisitionRetryable(ctx, err) {
+		return nil, err
+	}
+
+	retryTimer := time.NewTimer(schedule.Delay(m.config.RetryPeriod))
+	observeTimer := time.NewTimer(schedule.Delay(m.config.ObserveInterval))
+	defer stopTimer(retryTimer)
+	defer stopTimer(observeTimer)
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-retryTimer.C:
+			acquired, err = m.config.Client.Require(ctx)
+			if err == nil {
+				return acquired, nil
+			}
+			if !acquisitionRetryable(ctx, err) {
+				return nil, err
+			}
+			resetTimer(retryTimer, m.config.RetryPeriod)
+			resetTimer(observeTimer, m.config.ObserveInterval)
+		case <-observeTimer.C:
+			_, err = m.config.Client.Observe(ctx)
+			if err != nil && !observationRetryable(ctx, err) {
+				return nil, err
+			}
+			resetTimer(observeTimer, m.config.ObserveInterval)
+		}
+	}
+}
+
+func (m *Mutex) enter() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.busy {
+		return false
+	}
+	m.busy = true
+	return true
+}
+
+func (m *Mutex) finish(acquired *lease.Lease, runErr error) {
+	if errors.Is(runErr, ErrWorkNotStopped) {
+		return
+	}
+	if acquired.Check() == nil {
+		go func() {
+			<-acquired.Done()
+			m.clearBusy()
+		}()
+		return
+	}
+	m.clearBusy()
+}
+
+func (m *Mutex) clearBusy() {
+	m.mu.Lock()
+	m.busy = false
+	m.manual = nil
+	m.releasing = false
+	m.mu.Unlock()
+}
+
+func (m *Mutex) logError(err error) {
+	if err != nil {
+		m.config.Logger.Error("mutex lifecycle failed", zap.Error(err))
+	}
+}
+
+func acquisitionRetryable(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	return errors.Is(err, lease.ErrNotEligible) || errors.Is(err, lease.ErrConflict) ||
+		errors.Is(err, lease.ErrUnknownOutcome) || errors.Is(err, lease.ErrUnavailable) ||
+		errors.Is(err, context.DeadlineExceeded)
+}
+
+func observationRetryable(ctx context.Context, err error) bool {
+	return acquisitionRetryable(ctx, err) || errors.Is(err, lease.ErrNotFound)
+}
+
+func isNil(value any) bool {
+	if value == nil {
+		return true
+	}
+	v := reflect.ValueOf(value)
+	switch v.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return v.IsNil()
+	default:
+		return false
+	}
+}
+
+func resetTimer(timer *time.Timer, period time.Duration) {
+	stopTimer(timer)
+	timer.Reset(schedule.Delay(period))
+}
+
+func stopTimer(timer *time.Timer) {
+	if timer == nil || timer.Stop() {
+		return
+	}
+	select {
+	case <-timer.C:
+	default:
+	}
 }
