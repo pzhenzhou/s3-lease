@@ -23,12 +23,15 @@ type Config struct {
 
 // Run performs one immediate acquisition attempt, then interleaves jittered
 // retries and observations until it acquires or encounters a terminal error.
-// A Require attempt resets the observation timer because Require already read
-// current state while deciding eligibility.
+// Require reads remain internal protocol state: they do not replace the
+// independent observation cadence consumed by recipe callbacks.
 func Run(ctx context.Context, config Config) (*lease.Lease, error) {
 	acquired, err := config.Client.Require(ctx)
 	if err == nil {
 		return acquired, nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
 	}
 	if !Retryable(ctx, err) {
 		return nil, err
@@ -47,18 +50,24 @@ func Run(ctx context.Context, config Config) (*lease.Lease, error) {
 			if err == nil {
 				return acquired, nil
 			}
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
 			if !Retryable(ctx, err) {
 				return nil, err
 			}
 			resetTimer(retryTimer, config.RetryPeriod)
-			resetTimer(observeTimer, config.ObserveInterval)
 		case <-observeTimer.C:
 			observation, observeErr := config.Client.Observe(ctx)
 			if observeErr == nil {
 				if config.OnObservation != nil {
 					config.OnObservation(observation)
 				}
-			} else if !ObservationRetryable(ctx, observeErr) {
+			}
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			if observeErr != nil && !ObservationRetryable(ctx, observeErr) {
 				return nil, observeErr
 			}
 			resetTimer(observeTimer, config.ObserveInterval)

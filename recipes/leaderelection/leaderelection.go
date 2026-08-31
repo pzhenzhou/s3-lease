@@ -128,16 +128,18 @@ func (e *Elector) Run(ctx context.Context) (err error) {
 	epochID := acquired.EpochID()
 	e.config.Logger.Info("leader election acquisition confirmed", zap.Uint64("epoch_id", epochID))
 	fatalErrors := e.startElectedObserver(runCtx, dispatcher)
+	workAdmitted := false
 	err = holder.Run(ctx, acquired, holder.Work(e.config.Callbacks.OnStartedLeading), holder.Policy{
 		Client:              e.config.Client,
 		RetryPeriod:         e.config.RetryPeriod,
 		ShutdownTimeout:     e.config.ShutdownTimeout,
-		ReleaseOnWorkReturn: e.config.ReleaseOnCancel,
+		ReleaseOnWorkReturn: true,
 		ReleaseOnCancel:     e.config.ReleaseOnCancel,
 		LossError:           ErrLeadershipLost,
 		WorkNotStoppedError: ErrWorkNotStopped,
 		FatalErrors:         fatalErrors,
 		OnStarted: func() {
+			workAdmitted = true
 			e.config.Metrics.LeaderChanged(LeaderMetric{Held: true, EpochID: epochID})
 			e.config.Logger.Info("leader work started", zap.Uint64("epoch_id", epochID))
 		},
@@ -146,8 +148,10 @@ func (e *Elector) Run(ctx context.Context) (err error) {
 			dispatcher.Stop()
 			e.config.Metrics.LeaderChanged(LeaderMetric{Held: false, EpochID: epochID})
 			e.config.Logger.Info("leader work stopping", zap.Uint64("epoch_id", epochID))
-			if callback := e.config.Callbacks.OnStoppedLeading; callback != nil {
-				go callback()
+			if workAdmitted {
+				if callback := e.config.Callbacks.OnStoppedLeading; callback != nil {
+					go callback()
+				}
 			}
 		},
 		OnShutdown: func(duration time.Duration, timedOut bool) {

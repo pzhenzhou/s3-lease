@@ -2,7 +2,7 @@
 
 ## Architecture and Priorities
 
-Correctness and concurrency safety take priority over convenience and performance. The API is hierarchical: `lease/` provides the backend-neutral coordination core, while `recipes/leaderelection/` and `recipes/mutex/` build higher-level workflows from it. `lease/s3store/` adapts AWS SDK types to the core, and `examples/fencedmanifest/` demonstrates application-level fencing. Treat `docs/s3_lease_high_level_design_en.md` as the safety and protocol reference.
+Correctness and concurrency safety take priority over convenience and performance. The API is hierarchical: `lease/` provides the backend-neutral coordination core, while `recipes/leaderelection/` and `recipes/mutex/` build higher-level workflows from it. `lease/s3store/` adapts AWS SDK types to the core, and `examples/fencedmanifest/` demonstrates application-level fencing. Treat `docs/s3_lease_high_level_design.md` as the safety and protocol reference.
 
 Keep storage details out of the core and coordination policy out of storage adapters. A locally held lease is not sufficient protection for external writes; propagate and enforce fencing epochs where required.
 

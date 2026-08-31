@@ -25,7 +25,9 @@ go.work
 # editor and IDE paraphernalia
 .idea/
 .cursor/
-.github/
+.github/*
+!.github/workflows/
+!.github/workflows/*.yml
 .vscode
 .claude
 *.swp
