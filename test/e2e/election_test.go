@@ -19,7 +19,8 @@ func TestElectionLifecycleReleaseAndSameIDSuccession(t *testing.T) {
 	defer cancel()
 	key := testHarness.Key("election-lifecycle")
 
-	first, err := testHarness.StartCandidate(ctx, electionCandidateArgs(key, "same-id", 3*time.Second, 2*time.Second, 700*time.Millisecond)...)
+	firstArgs := append(electionCandidateArgs(key, "same-id", 3*time.Second, 2*time.Second, 700*time.Millisecond), "--release-on-cancel=false")
+	first, err := testHarness.StartCandidate(ctx, firstArgs...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +87,7 @@ func TestConcurrentElectionCandidatesConfirmOneInitialLeader(t *testing.T) {
 	key := testHarness.Key("election-contention")
 	candidates := make([]*harness.Candidate, 0, 3)
 	for _, clientID := range []string{"candidate-a", "candidate-b", "candidate-c"} {
-		candidate, err := testHarness.StartCandidate(ctx, electionCandidateArgs(key, clientID, 3*time.Second, 2*time.Second, 500*time.Millisecond)...)
+		candidate, err := testHarness.StartCandidate(ctx, electionCandidateArgs(key, clientID, 3*time.Second, 2*time.Second, 2*time.Second)...)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -98,15 +99,40 @@ func TestConcurrentElectionCandidatesConfirmOneInitialLeader(t *testing.T) {
 		}
 	}
 	initialLeaders := 0
+	initialLeaderID := ""
 	for _, candidate := range candidates {
 		for _, event := range candidate.Events() {
 			if event.Message == "candidate_election_work_started" && event.EpochID == 1 {
 				initialLeaders++
+				initialLeaderID = event.ClientID
 			}
 		}
 	}
 	if initialLeaders != 1 {
 		t.Fatalf("confirmed initial leaders = %d, want exactly one", initialLeaders)
+	}
+	for _, candidate := range candidates {
+		candidateID := ""
+		for _, event := range candidate.Events() {
+			if event.Message == "candidate_election_work_started" {
+				candidateID = event.ClientID
+				break
+			}
+		}
+		if candidateID == initialLeaderID {
+			continue
+		}
+		observed := false
+		for _, event := range candidate.Events() {
+			if event.Message == "candidate_election_observer_started" && event.EpochID == 1 &&
+				event.ObservedClientID == initialLeaderID {
+				observed = true
+				break
+			}
+		}
+		if !observed {
+			t.Fatalf("candidate %s did not observe initial leader %s: %+v", candidate.Name, initialLeaderID, candidate.Events())
+		}
 	}
 }
 

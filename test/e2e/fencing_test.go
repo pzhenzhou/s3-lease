@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pzhenzhou/s3-lease/examples/fencedmanifest"
 	"github.com/pzhenzhou/s3-lease/lease"
-	"github.com/pzhenzhou/s3-lease/test/e2e/internal/fencedresource"
 	"github.com/pzhenzhou/s3-lease/test/e2e/internal/harness"
 )
 
@@ -32,8 +32,14 @@ func TestPausedOldLeaderIsRejectedAfterReplacementActivation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resource := fencedresource.New(store, lease.Key{Bucket: testHarness.Bucket, ObjectKey: resourceKey})
-	if _, err := resource.Apply(ctx, oldEvent.EpochID, "old-before-pause"); err != nil {
+	resource, err := fencedmanifest.NewWriter(store, lease.Key{Bucket: testHarness.Bucket, ObjectKey: resourceKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resource.Activate(ctx, oldEvent.EpochID, "activate-old"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resource.Publish(ctx, oldEvent.EpochID, "old-before-pause", []byte(`{"owner":"old"}`)); err != nil {
 		t.Fatal(err)
 	}
 	if err := oldLeader.Pause(ctx); err != nil {
@@ -52,13 +58,16 @@ func TestPausedOldLeaderIsRejectedAfterReplacementActivation(t *testing.T) {
 	if newEvent.EpochID <= oldEvent.EpochID {
 		t.Fatalf("replacement epoch %d did not exceed paused epoch %d", newEvent.EpochID, oldEvent.EpochID)
 	}
-	if _, err := resource.Apply(ctx, newEvent.EpochID, "replacement-activated"); err != nil {
+	if _, err := resource.Activate(ctx, newEvent.EpochID, "activate-replacement"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resource.Publish(ctx, newEvent.EpochID, "replacement-publish", []byte(`{"owner":"replacement"}`)); err != nil {
 		t.Fatal(err)
 	}
 	if err := oldLeader.Unpause(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := resource.Apply(ctx, oldEvent.EpochID, "resumed-stale-mutation"); !errors.Is(err, fencedresource.ErrFenced) {
+	if _, err := resource.Publish(ctx, oldEvent.EpochID, "resumed-stale-mutation", []byte(`{"owner":"stale"}`)); !errors.Is(err, fencedmanifest.ErrFenced) {
 		t.Fatalf("resumed stale mutation = %v, want ErrFenced", err)
 	}
 	_, _ = oldLeader.Wait()
@@ -69,9 +78,11 @@ func TestPausedOldLeaderIsRejectedAfterReplacementActivation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.EpochWatermark != newEvent.EpochID || len(state.History) != 2 {
-		t.Fatalf("fenced resource accepted stale history: %+v", state)
+	if state.AcceptedEpochID != newEvent.EpochID || state.Revision != 4 || len(state.History) != 4 ||
+		string(state.Payload) != `{"owner":"replacement"}` {
+		t.Fatalf("fenced manifest accepted stale mutation: %+v payload=%s", state, state.Payload)
 	}
+	assertFencedHistory(t, state.History, oldEvent.EpochID, newEvent.EpochID)
 }
 
 func TestFencedResourceRejectsStaleEpochAndSurvivesStoreRestart(t *testing.T) {
@@ -88,8 +99,14 @@ func TestFencedResourceRejectsStaleEpochAndSurvivesStoreRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resource := fencedresource.New(store, lease.Key{Bucket: testHarness.Bucket, ObjectKey: resourceKey})
-	if _, err := resource.Apply(ctx, oldLease.EpochID(), "old-before-replacement"); err != nil {
+	resource, err := fencedmanifest.NewWriter(store, lease.Key{Bucket: testHarness.Bucket, ObjectKey: resourceKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resource.Activate(ctx, oldLease.EpochID(), "activate-old"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resource.Publish(ctx, oldLease.EpochID(), "old-before-replacement", []byte(`{"owner":"old"}`)); err != nil {
 		t.Fatal(err)
 	}
 	if err := oldClient.Release(ctx, oldLease); err != nil {
@@ -104,10 +121,13 @@ func TestFencedResourceRejectsStaleEpochAndSurvivesStoreRestart(t *testing.T) {
 	if newLease.EpochID() != 2 {
 		t.Fatalf("replacement epoch = %d, want 2", newLease.EpochID())
 	}
-	if _, err := resource.Apply(ctx, newLease.EpochID(), "replacement-activated"); err != nil {
+	if _, err := resource.Activate(ctx, newLease.EpochID(), "activate-replacement"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := resource.Apply(ctx, oldLease.EpochID(), "resumed-stale-write"); !errors.Is(err, fencedresource.ErrFenced) {
+	if _, err := resource.Publish(ctx, newLease.EpochID(), "replacement-publish", []byte(`{"owner":"replacement"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resource.Publish(ctx, oldLease.EpochID(), "resumed-stale-write", []byte(`{"owner":"stale"}`)); !errors.Is(err, fencedmanifest.ErrFenced) {
 		t.Fatalf("stale mutation = %v, want ErrFenced", err)
 	}
 	beforeRestart, err := successorClient.Observe(ctx)
@@ -131,7 +151,21 @@ func TestFencedResourceRejectsStaleEpochAndSurvivesStoreRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.EpochWatermark != 2 || len(state.History) != 2 {
-		t.Fatalf("protected history after restart = %+v", state)
+	if state.AcceptedEpochID != 2 || state.Revision != 4 || len(state.History) != 4 ||
+		string(state.Payload) != `{"owner":"replacement"}` {
+		t.Fatalf("protected manifest after restart = %+v payload=%s", state, state.Payload)
+	}
+	assertFencedHistory(t, state.History, oldLease.EpochID(), newLease.EpochID())
+}
+
+func assertFencedHistory(t *testing.T, history []fencedmanifest.HistoryEntry, oldEpoch, newEpoch uint64) {
+	t.Helper()
+	wantEpochs := []uint64{oldEpoch, oldEpoch, newEpoch, newEpoch}
+	wantActivations := []bool{true, false, true, false}
+	for index, entry := range history {
+		if entry.EpochID != wantEpochs[index] || entry.Activation != wantActivations[index] {
+			t.Fatalf("manifest history[%d] = %+v, want epoch=%d activation=%v; history=%+v",
+				index, entry, wantEpochs[index], wantActivations[index], history)
+		}
 	}
 }

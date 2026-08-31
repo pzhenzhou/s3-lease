@@ -119,7 +119,14 @@ running:
 			switch {
 			case result.err == nil:
 				renewalPending = false
-				resetTimer(renewTimer, policy.RetryPeriod)
+				if result.resolving {
+					// Reconciliation confirms the original proposal and its
+					// original first-send deadline. Renew again immediately so
+					// response loss cannot consume most of the remaining margin.
+					resetTimer(renewTimer, 0)
+				} else {
+					resetTimer(renewTimer, policy.RetryPeriod)
+				}
 			case ctx.Err() != nil:
 				cause = stopCallerCanceled
 				primary = ctx.Err()
@@ -127,7 +134,15 @@ running:
 				break running
 			case errors.Is(result.err, lease.ErrUnknownOutcome):
 				renewalPending = true
-				resetTimer(renewTimer, policy.RetryPeriod)
+				if result.resolving {
+					// Repeated ambiguity while reconciling must not become a
+					// request hot loop. Preserve the proposal and retry normally.
+					resetTimer(renewTimer, policy.RetryPeriod)
+				} else {
+					// Resolve the first ambiguous result promptly. This does not
+					// allocate a new renewal or change its conditional body.
+					resetTimer(renewTimer, 0)
+				}
 			case retryable(result.err):
 				// A transient reconciliation failure leaves the exact frozen
 				// proposal unresolved. Keep reconciling it until authority ends;

@@ -168,6 +168,20 @@ func containerEndpoint(endpoint string) (string, error) {
 	return parsed.String(), nil
 }
 
+// composeServiceEndpoint translates the host-visible SeaweedFS endpoint to
+// the stable service address on the Compose network. The published host port
+// may differ, but service-to-service traffic always uses the container port.
+func composeServiceEndpoint(endpoint string) (string, error) {
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return "", fmt.Errorf("parse E2E endpoint: %w", err)
+	}
+	if host := parsed.Hostname(); host == "127.0.0.1" || host == "localhost" {
+		parsed.Host = "seaweedfs:8333"
+	}
+	return parsed.String(), nil
+}
+
 func uniqueID() string {
 	var raw [12]byte
 	if _, err := rand.Read(raw[:]); err != nil {

@@ -55,15 +55,15 @@ func (h *Harness) StartCandidate(ctx context.Context, args ...string) (*Candidat
 	if h.CandidateImage == "" {
 		return nil, errors.New("S3_LEASE_E2E_CANDIDATE_IMAGE is required; run through make e2e")
 	}
-	endpoint, err := containerEndpoint(h.Endpoint)
+	endpoint, err := composeServiceEndpoint(h.Endpoint)
 	if err != nil {
 		return nil, err
 	}
 	name := h.nextCandidateName()
 	commandArgs := []string{
-		"run", "--rm", "--name", name,
-		"--add-host", "host.docker.internal:host-gateway",
-		h.CandidateImage,
+		"compose", "-p", h.ComposeProject, "-f", h.ComposeFile,
+		"run", "--rm", "--no-deps", "--name", name,
+		"candidate",
 		"--endpoint", endpoint,
 		"--region", h.Region,
 		"--bucket", h.Bucket,

@@ -1,0 +1,40 @@
+name: AWS compatibility
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  aws-s3:
+    runs-on: ubuntu-latest
+    environment: aws-compat
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Validate environment configuration
+        env:
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          S3_LEASE_AWS_BUCKET: ${{ vars.S3_LEASE_AWS_BUCKET }}
+        run: |
+          test -n "$AWS_ROLE_ARN"
+          test -n "$AWS_REGION"
+          test -n "$S3_LEASE_AWS_BUCKET"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Run AWS S3 qualification
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          S3_LEASE_AWS_BUCKET: ${{ vars.S3_LEASE_AWS_BUCKET }}
+          S3_LEASE_AWS_PREFIX: qualification/${{ github.run_id }}-${{ github.run_attempt }}
+        run: make test-aws
