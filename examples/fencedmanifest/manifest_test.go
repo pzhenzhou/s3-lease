@@ -164,6 +164,73 @@ func TestWriterKeepsOlderMutationIDsIdempotentWithinHistory(t *testing.T) {
 	}
 }
 
+func TestWriterValidatesBoundedHistory(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("incomplete history before cap", func(t *testing.T) {
+		store := &manifestStore{}
+		writer := newTestWriter(t, store)
+		if _, err := writer.Activate(ctx, 1, "activate"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writer.Publish(ctx, 1, "publish", []byte(`true`)); err != nil {
+			t.Fatal(err)
+		}
+		record := store.record(t)
+		record.History = append([]historyRecord(nil), record.History[1:]...)
+		store.replace(t, record)
+		if _, err := writer.Read(ctx); !errors.Is(err, ErrInvalidManifest) {
+			t.Fatalf("Read = %v, want ErrInvalidManifest", err)
+		}
+	})
+
+	t.Run("complete history starts with activation", func(t *testing.T) {
+		store := &manifestStore{}
+		writer := newTestWriter(t, store)
+		if _, err := writer.Activate(ctx, 1, "activate"); err != nil {
+			t.Fatal(err)
+		}
+		record := store.record(t)
+		record.History[0].Activation = false
+		store.replace(t, record)
+		if _, err := writer.Read(ctx); !errors.Is(err, ErrInvalidManifest) {
+			t.Fatalf("Read = %v, want ErrInvalidManifest", err)
+		}
+	})
+
+	t.Run("truncated history at cap", func(t *testing.T) {
+		store := &manifestStore{}
+		writer := newTestWriter(t, store)
+		if _, err := writer.Activate(ctx, 1, "activate"); err != nil {
+			t.Fatal(err)
+		}
+		for revision := 2; revision <= maxHistoryEntries+1; revision++ {
+			mutationID := fmt.Sprintf("publish-%d", revision)
+			payload := []byte(fmt.Sprintf(`{"revision":%d}`, revision))
+			if _, err := writer.Publish(ctx, 1, mutationID, payload); err != nil {
+				t.Fatal(err)
+			}
+		}
+		manifest, err := writer.Read(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if manifest.Revision != maxHistoryEntries+1 || len(manifest.History) != maxHistoryEntries {
+			t.Fatalf("manifest = revision %d history %d, want revision %d history %d",
+				manifest.Revision, len(manifest.History), maxHistoryEntries+1, maxHistoryEntries)
+		}
+		if manifest.History[0].Activation {
+			t.Fatal("first retained entry unexpectedly required activation after truncation")
+		}
+		record := store.record(t)
+		record.History = append([]historyRecord(nil), record.History[1:]...)
+		store.replace(t, record)
+		if _, err := writer.Read(ctx); !errors.Is(err, ErrInvalidManifest) {
+			t.Fatalf("Read incomplete capped history = %v, want ErrInvalidManifest", err)
+		}
+	})
+}
+
 func TestWriterRejectsConcurrentMutation(t *testing.T) {
 	store := &manifestStore{}
 	writer := newTestWriter(t, store)

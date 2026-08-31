@@ -521,9 +521,11 @@ func newHistoryRecord(request mutationRequest) historyRecord {
 }
 
 func validHistory(record manifestRecord) bool {
-	if len(record.History) == 0 || len(record.History) > maxHistoryEntries || record.Revision < uint64(len(record.History)) {
+	expectedLength := min(record.Revision, uint64(maxHistoryEntries))
+	if uint64(len(record.History)) != expectedLength {
 		return false
 	}
+	completeHistory := record.Revision <= uint64(maxHistoryEntries)
 	seen := make(map[string]struct{}, len(record.History))
 	var previousEpoch uint64
 	for index, entry := range record.History {
@@ -536,6 +538,9 @@ func validHistory(record manifestRecord) bool {
 			return false
 		}
 		seen[entry.MutationID] = struct{}{}
+		if index == 0 && completeHistory && !entry.Activation {
+			return false
+		}
 		if index > 0 && entry.Activation != (entry.EpochID > previousEpoch) {
 			return false
 		}
