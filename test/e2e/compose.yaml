@@ -11,5 +11,11 @@ services:
     volumes:
       - seaweedfs-data:/data
 
+  candidate:
+    image: "${S3_LEASE_E2E_CANDIDATE_IMAGE:-s3-lease-e2e:dev}"
+    profiles: ["candidate"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
 volumes:
   seaweedfs-data:

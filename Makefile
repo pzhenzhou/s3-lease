@@ -50,7 +50,8 @@ e2e: ## Run tagged tests against a disposable SeaweedFS fixture.
 	trap '$(MAKE) --no-print-directory e2e-down' EXIT INT TERM; \
 	$(MAKE) --no-print-directory e2e-up; \
 	$(MAKE) --no-print-directory docker-build; \
-	E2E_PROJECT='$(E2E_PROJECT)' S3_LEASE_E2E_ENDPOINT='$(S3_LEASE_E2E_ENDPOINT)' \
+	CONTAINER_TOOL='$(CONTAINER_TOOL)' E2E_PROJECT='$(E2E_PROJECT)' \
+		E2E_COMPOSE_FILE='$(abspath $(E2E_COMPOSE_FILE))' S3_LEASE_E2E_ENDPOINT='$(S3_LEASE_E2E_ENDPOINT)' \
 		S3_LEASE_E2E_CANDIDATE_IMAGE='$(IMG)' go test -tags=e2e -count=1 -timeout=10m ./test/e2e/...
 
 e2e-race: ## Run tagged host-side tests with the race detector.
@@ -58,7 +59,8 @@ e2e-race: ## Run tagged host-side tests with the race detector.
 	trap '$(MAKE) --no-print-directory e2e-down' EXIT INT TERM; \
 	$(MAKE) --no-print-directory e2e-up; \
 	$(MAKE) --no-print-directory docker-build; \
-	E2E_PROJECT='$(E2E_PROJECT)' S3_LEASE_E2E_ENDPOINT='$(S3_LEASE_E2E_ENDPOINT)' \
+	CONTAINER_TOOL='$(CONTAINER_TOOL)' E2E_PROJECT='$(E2E_PROJECT)' \
+		E2E_COMPOSE_FILE='$(abspath $(E2E_COMPOSE_FILE))' S3_LEASE_E2E_ENDPOINT='$(S3_LEASE_E2E_ENDPOINT)' \
 		S3_LEASE_E2E_CANDIDATE_IMAGE='$(IMG)' go test -race -tags=e2e -count=1 -timeout=15m ./test/e2e/...
 
 docker-build: ## Build and load the current-platform E2E candidate image.
